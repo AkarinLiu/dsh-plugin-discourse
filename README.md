@@ -1,5 +1,7 @@
 # dsh-plugin-discourse
 
+[![npm](https://img.shields.io/npm/v/dsh-plugin-discourse.svg)](https://www.npmjs.com/package/dsh-plugin-discourse)
+
 Discourse administration and agent tools for the [DeepSeek Harness](https://github.com/deepseek-ai).
 
 One Host plugin registers 16 model-facing tools over the Discourse REST API: an agent can search a
@@ -39,18 +41,22 @@ thread search never floods the model context. Results keep ids, so a follow-up c
 The bundle is a profile plugin: it is installed into one DSH profile and selected in that profile's
 bundle list.
 
-**From the Web UI** — open *Settings → Plugins → Install bundle* and give it the package directory
-(for a clone) or a package spec such as `github:AkarinLiu/dsh-plugin-discourse`. DSH installs the
-package, adds it to the profile's bundle list, and activates it.
-
-**From the CLI** — the launcher passes everything after `plugin` to pnpm:
+**From npm** — the package is published as
+[`dsh-plugin-discourse`](https://www.npmjs.com/package/dsh-plugin-discourse). The launcher passes
+everything after `plugin` to pnpm:
 
 ```bash
-gh repo clone AkarinLiu/dsh-plugin-discourse
-dsh plugin --profile desktop add ./dsh-plugin-discourse
+dsh plugin --profile desktop add dsh-plugin-discourse
 ```
 
-That installs the package; select `dsh-plugin-discourse` once in the Plugins page (or through the
+**From the Web UI** — open *Settings → Plugins → Install bundle* and give it `dsh-plugin-discourse`
+for the npm package, or `github:AkarinLiu/dsh-plugin-discourse`, or a local clone path. DSH installs
+the package, adds it to the profile's bundle list, and activates it.
+
+**From a clone** — `gh repo clone AkarinLiu/dsh-plugin-discourse`, then
+`dsh plugin --profile desktop add ./dsh-plugin-discourse`.
+
+After a CLI install, select `dsh-plugin-discourse` once in the Plugins page (or through the
 `plugin_manager` tool) so the profile records it as a bundle.
 
 To remove it, uninstall the bundle from the Plugins page, which drops the dependency and the bundle
@@ -132,7 +138,7 @@ without starting a Harness.
 ## 中文说明
 
 - 这是一个 **Host 插件**，向 DSH 智能体提供 16 个 Discourse 工具（读取 / 发帖 / 版主 / 管理员）。
-- 安装：在 DSH Web UI 的 *设置 → 插件 → 安装 bundle* 中选择本仓库目录，或填入 `github:AkarinLiu/dsh-plugin-discourse`。
+- 安装：`dsh plugin --profile desktop add dsh-plugin-discourse`（已发布到 npm），或在 Web UI 的 *设置 → 插件 → 安装 bundle* 中填入 `dsh-plugin-discourse` / `github:AkarinLiu/dsh-plugin-discourse`。
 - 配置：在 profile 的 `cordis.patch.yml` 中加一条 `id: discourse` 的覆盖，把 `baseUrl` 改成你的论坛并填入 `apiKey`（覆盖会整体替换 `config`，请把其它键一并写全）。
 - 不需要 API Key 即可试用只读工具（默认指向 `https://meta.discourse.org`）。
 - 密钥建议通过环境变量 `DISCOURSE_API_KEY` / `DISCOURSE_API_USERNAME` 提供，避免写进配置文件。

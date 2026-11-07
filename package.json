@@ -1,10 +1,35 @@
 {
   "name": "dsh-plugin-discourse",
   "version": "1.0.0",
-  "private": true,
-  "type": "module",
-  "description": "Discourse administration and agent tools for the DeepSeek Harness",
+  "description": "Discourse administration and agent tools for the DeepSeek Harness: 16 tools for reading, posting, moderating, and administering a Discourse forum.",
   "license": "MIT",
+  "author": "AkarinLiu",
+  "type": "module",
+  "engines": {
+    "node": ">=20"
+  },
+  "keywords": [
+    "dsh",
+    "deepseek-harness",
+    "discourse",
+    "forum",
+    "plugin",
+    "agent-tools",
+    "moderation",
+    "chatops"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/AkarinLiu/dsh-plugin-discourse.git"
+  },
+  "homepage": "https://github.com/AkarinLiu/dsh-plugin-discourse#readme",
+  "bugs": {
+    "url": "https://github.com/AkarinLiu/dsh-plugin-discourse/issues"
+  },
+  "publishConfig": {
+    "registry": "https://registry.npmjs.org",
+    "access": "public"
+  },
   "exports": {
     ".": "./index.js",
     "./locale/*.json": "./locale/*.json",
@@ -16,7 +41,8 @@
     "README.md",
     "LICENSE",
     "locale/*.json",
-    "icon.svg"
+    "icon.svg",
+    "scripts/"
   ],
   "dsh": {
     "bundle": {
