@@ -189,9 +189,20 @@ push to `main` or a `v*` tag, and every pull request, verifies the package, and 
 3. The workflow runs on Node 24, verifies the tarball, checks `v<version>`, and publishes with
    `--provenance --access public`.
 
-Add a repository secret named `NPM_TOKEN` before the first release: an npm **automation** token (or a
-granular token with publish access to this package and 2FA bypass) is required for non-interactive
-publishing. Provenance is signed through GitHub OIDC (`id-token: write`), not by the token.
+Before the first release, add a **Trusted Publisher** on npmjs.com (package page → *Settings* →
+*Trusted Publishing* → *GitHub Actions*):
+
+| Field | Value |
+|---|---|
+| Repository | `AkarinLiu/dsh-plugin-discourse` |
+| Workflow file | `publish.yml` |
+| Environment | *(leave empty)* |
+| Allowed action | `npm publish` |
+
+No `NPM_TOKEN` secret is needed: the workflow exchanges the GitHub OIDC token
+(`id-token: write`) for publish rights and attaches provenance. npm now requires an interactive 2FA
+challenge for token and trusted-publisher management, so this one-time setup happens in the browser;
+after it, tagged releases are fully automatic.
 
 ## 中文说明
 
@@ -199,7 +210,7 @@ publishing. Provenance is signed through GitHub OIDC (`id-token: write`), not by
 - 安装：优先用 Web UI 的 *设置 → 插件 → 安装 bundle*，填入 `dsh-plugin-discourse`（npm）或 `github:AkarinLiu/dsh-plugin-discourse`；安装器会先替换旧的本地链接。
 - 命令行：`dsh plugin --profile desktop add dsh-plugin-discourse` 只是把参数转交给 pnpm，安装后还需在插件页选中该 bundle。
 - Windows 从本地克隆切到 npm 时报 `ERR_PNPM_EPERM ... rename ...dsh-plugin-discourse...`：这是 profile 里遗留的目录联接；运行 `node scripts/doctor.mjs --profile desktop --fix` 后再安装（脚本只删链接，不动源码），然后重启 Harness。
-- 发布：推送 `v*` 标签会触发 `.github/workflows/publish.yml`，使用仓库密钥 `NPM_TOKEN` 发布到 npm 并生成 provenance。
+- 发布：推送 `v*` 标签会触发 `.github/workflows/publish.yml`。首次发布前在 npmjs.com 的包设置 → *Trusted Publishing* 添加 GitHub Actions（仓库 `AkarinLiu/dsh-plugin-discourse`、工作流 `publish.yml`、环境留空、允许 `npm publish`），之后不需要 `NPM_TOKEN`，由 OIDC 发布并生成 provenance。
 - 配置：在 profile 的 `cordis.patch.yml` 中加一条 `id: discourse` 的覆盖，把 `baseUrl` 改成你的论坛并填入 `apiKey`（覆盖会整体替换 `config`，请把其它键一并写全）。
 - 不需要 API Key 即可试用只读工具（默认指向 `https://meta.discourse.org`）。
 - 密钥建议通过环境变量 `DISCOURSE_API_KEY` / `DISCOURSE_API_USERNAME` 提供，避免写进配置文件。

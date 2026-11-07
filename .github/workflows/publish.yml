@@ -53,20 +53,12 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      - name: Set up Node.js for npmjs.com
+      # Trusted publishing: npm exchanges the GitHub OIDC token for publish
+      # rights, so this job carries no long-lived npm token.
+      - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
           node-version: 24
-          registry-url: https://registry.npmjs.org
-
-      - name: Require the NPM_TOKEN secret
-        env:
-          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
-        run: |
-          if [ -z "$NPM_TOKEN" ]; then
-            echo "::error::Add a repository secret named NPM_TOKEN with an npm automation token that can publish this package."
-            exit 1
-          fi
 
       - name: Check that the tag matches package.json
         run: |
@@ -79,8 +71,6 @@ jobs:
 
       - name: Publish with provenance
         run: npm publish --provenance --access public
-        env:
-          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
 
       - name: Summarize
         run: |
