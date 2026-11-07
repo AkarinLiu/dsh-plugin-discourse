@@ -1,6 +1,7 @@
 # dsh-plugin-discourse
 
 [![npm](https://img.shields.io/npm/v/dsh-plugin-discourse.svg)](https://www.npmjs.com/package/dsh-plugin-discourse)
+[![Publish to npm](https://github.com/AkarinLiu/dsh-plugin-discourse/actions/workflows/publish.yml/badge.svg)](https://github.com/AkarinLiu/dsh-plugin-discourse/actions/workflows/publish.yml)
 
 Discourse administration and agent tools for the [DeepSeek Harness](https://github.com/deepseek-ai).
 
@@ -39,30 +40,61 @@ thread search never floods the model context. Results keep ids, so a follow-up c
 ## Install
 
 The bundle is a profile plugin: it is installed into one DSH profile and selected in that profile's
-bundle list.
+bundle list. Install it through the Web UI when you can: DSH's bundle installer replaces an existing
+copy or local link before it writes the package, while the CLI is a thin pnpm wrapper.
 
-**From npm** — the package is published as
-[`dsh-plugin-discourse`](https://www.npmjs.com/package/dsh-plugin-discourse). The launcher passes
-everything after `plugin` to pnpm:
+**From the Web UI (recommended)** — open *Settings → Plugins → Install bundle* and enter
+`dsh-plugin-discourse` for the npm package, or `github:AkarinLiu/dsh-plugin-discourse`, or a local
+clone path. DSH installs the package, adds it to the profile's bundle list, and activates it.
+
+**From npm on the CLI** — the launcher passes everything after `plugin` to pnpm, so this is a plain
+pnpm install rather than the bundle installer:
 
 ```bash
 dsh plugin --profile desktop add dsh-plugin-discourse
 ```
 
-**From the Web UI** — open *Settings → Plugins → Install bundle* and give it `dsh-plugin-discourse`
-for the npm package, or `github:AkarinLiu/dsh-plugin-discourse`, or a local clone path. DSH installs
-the package, adds it to the profile's bundle list, and activates it.
-
-**From a clone** — `gh repo clone AkarinLiu/dsh-plugin-discourse`, then
-`dsh plugin --profile desktop add ./dsh-plugin-discourse`.
-
 After a CLI install, select `dsh-plugin-discourse` once in the Plugins page (or through the
 `plugin_manager` tool) so the profile records it as a bundle.
+
+**From a clone** — `gh repo clone AkarinLiu/dsh-plugin-discourse`, then
+`dsh plugin --profile desktop add ./dsh-plugin-discourse`. On Windows this creates a directory
+junction in the profile; read the next section before moving that profile to the npm package.
 
 To remove it, uninstall the bundle from the Plugins page, which drops the dependency and the bundle
 entry together.
 
 > The plugin is Host-only: no build step, no dependencies, no client assets.
+
+### Windows: EPERM when replacing a local link
+
+A clone install leaves `node_modules\dsh-plugin-discourse` as a directory junction. pnpm's hoisted
+linker does not always record or prune that junction, so a later npm install cannot replace it and
+Windows refuses the rename:
+
+```text
+[ERR_PNPM_EPERM] [importPackage ...\node_modules\dsh-plugin-discourse]
+EPERM: operation not permitted, rename '...dsh-plugin-discourse_tmp_...' -> '...dsh-plugin-discourse'
+```
+
+The checkout is untouched; only the link is stale. From a clone of this repository, let the bundled
+doctor remove the link and then reinstall:
+
+```bash
+node scripts/doctor.mjs --profile desktop --fix
+dsh plugin --profile desktop add dsh-plugin-discourse
+```
+
+Or delete the junction by hand and retry:
+
+```powershell
+$link = "$env:USERPROFILE\.dsh\profiles\desktop\node_modules\dsh-plugin-discourse"
+if ((Get-Item $link -Force -ErrorAction SilentlyContinue).LinkType -eq 'Junction') {
+  (Get-Item $link -Force).Delete()
+}
+```
+
+Restart the Harness after the package is replaced so the new module generation loads.
 
 ## Configure
 
@@ -127,18 +159,47 @@ Row config wins over the environment when both are present.
 The package is plain ESM with no runtime dependencies; `index.js` is the whole plugin.
 
 ```bash
-node --check index.js          # syntax
-node scripts/smoke.mjs         # register every tool and validate definitions offline
-node scripts/smoke.mjs --live  # additionally call read-only tools against the configured forum
+node --check index.js                          # syntax
+npm test                                      # register every tool and validate definitions offline
+node scripts/smoke.mjs --live                 # additionally call read-only tools against the forum
+npm run verify                                # build the npm tarball and check its file list
+node scripts/doctor.mjs --profile desktop     # inspect a profile for a stale local link
 ```
 
 `scripts/smoke.mjs` drives `apply()` with a stub context, so it exercises the real registration path
-without starting a Harness.
+without starting a Harness. `scripts/verify-package.mjs` packs the package with `npm pack` and fails
+when a runtime file is missing from `files`, when the manifest loses `dsh.bundle`, or when a locale
+loses its display metadata. `prepack` runs the smoke test, so a broken package cannot be published.
+
+## Release
+
+Releases are automated by [`.github/workflows/publish.yml`](.github/workflows/publish.yml): every
+push to `main` or a `v*` tag, and every pull request, verifies the package, and a `v*` tag publishes it to
+[npmjs.com](https://www.npmjs.com/package/dsh-plugin-discourse) with
+[provenance](https://docs.npmjs.com/generating-provenance-statements).
+
+1. Bump `version` in `package.json` (the tag must match it exactly).
+2. Commit, then tag and push:
+
+   ```bash
+   git tag -a v1.0.1 -m "dsh-plugin-discourse 1.0.1"
+   git push origin main --follow-tags
+   ```
+
+3. The workflow runs on Node 24, verifies the tarball, checks `v<version>`, and publishes with
+   `--provenance --access public`.
+
+Add a repository secret named `NPM_TOKEN` before the first release: an npm **automation** token (or a
+granular token with publish access to this package and 2FA bypass) is required for non-interactive
+publishing. Provenance is signed through GitHub OIDC (`id-token: write`), not by the token.
 
 ## 中文说明
 
 - 这是一个 **Host 插件**，向 DSH 智能体提供 16 个 Discourse 工具（读取 / 发帖 / 版主 / 管理员）。
-- 安装：`dsh plugin --profile desktop add dsh-plugin-discourse`（已发布到 npm），或在 Web UI 的 *设置 → 插件 → 安装 bundle* 中填入 `dsh-plugin-discourse` / `github:AkarinLiu/dsh-plugin-discourse`。
+- 安装：优先用 Web UI 的 *设置 → 插件 → 安装 bundle*，填入 `dsh-plugin-discourse`（npm）或 `github:AkarinLiu/dsh-plugin-discourse`；安装器会先替换旧的本地链接。
+- 命令行：`dsh plugin --profile desktop add dsh-plugin-discourse` 只是把参数转交给 pnpm，安装后还需在插件页选中该 bundle。
+- Windows 从本地克隆切到 npm 时报 `ERR_PNPM_EPERM ... rename ...dsh-plugin-discourse...`：这是 profile 里遗留的目录联接；运行 `node scripts/doctor.mjs --profile desktop --fix` 后再安装（脚本只删链接，不动源码），然后重启 Harness。
+- 发布：推送 `v*` 标签会触发 `.github/workflows/publish.yml`，使用仓库密钥 `NPM_TOKEN` 发布到 npm 并生成 provenance。
 - 配置：在 profile 的 `cordis.patch.yml` 中加一条 `id: discourse` 的覆盖，把 `baseUrl` 改成你的论坛并填入 `apiKey`（覆盖会整体替换 `config`，请把其它键一并写全）。
 - 不需要 API Key 即可试用只读工具（默认指向 `https://meta.discourse.org`）。
 - 密钥建议通过环境变量 `DISCOURSE_API_KEY` / `DISCOURSE_API_USERNAME` 提供，避免写进配置文件。

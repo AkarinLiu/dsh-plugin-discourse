@@ -1,6 +1,6 @@
 {
   "name": "dsh-plugin-discourse",
-  "version": "1.0.0",
+  "version": "1.0.1",
   "description": "Discourse administration and agent tools for the DeepSeek Harness: 16 tools for reading, posting, moderating, and administering a Discourse forum.",
   "license": "MIT",
   "author": "AkarinLiu",
@@ -29,6 +29,12 @@
   "publishConfig": {
     "registry": "https://registry.npmjs.org",
     "access": "public"
+  },
+  "scripts": {
+    "test": "node scripts/smoke.mjs",
+    "verify": "node scripts/verify-package.mjs",
+    "doctor": "node scripts/doctor.mjs",
+    "prepack": "node scripts/smoke.mjs"
   },
   "exports": {
     ".": "./index.js",

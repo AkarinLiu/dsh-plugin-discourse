@@ -1,0 +1,95 @@
+name: Publish to npm
+
+on:
+  push:
+    branches: [main]
+    tags: ['v*']
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: npm-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  verify:
+    name: Verify package
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+
+      - name: Syntax-check the Host entry
+        run: node --check index.js
+
+      - name: Register every tool against a stub context
+        run: npm test
+
+      - name: Verify the packed tarball
+        run: npm run verify
+
+      - name: Dry-run the publish
+        run: npm publish --dry-run --access public --ignore-scripts
+
+  publish:
+    name: Publish ${{ github.ref_name }} to npmjs.com
+    needs: verify
+    if: github.event_name == 'push' && startsWith(github.ref, 'refs/tags/v')
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    permissions:
+      contents: read
+      id-token: write
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js for npmjs.com
+        uses: actions/setup-node@v4
+        with:
+          node-version: 24
+          registry-url: https://registry.npmjs.org
+
+      - name: Require the NPM_TOKEN secret
+        env:
+          NPM_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NPM_TOKEN" ]; then
+            echo "::error::Add a repository secret named NPM_TOKEN with an npm automation token that can publish this package."
+            exit 1
+          fi
+
+      - name: Check that the tag matches package.json
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if [ "v$version" != "${GITHUB_REF_NAME}" ]; then
+            echo "::error::Tag ${GITHUB_REF_NAME} does not match package.json version v$version. Bump the version, commit, and tag again."
+            exit 1
+          fi
+          echo "Publishing $version from tag ${GITHUB_REF_NAME}"
+
+      - name: Publish with provenance
+        run: npm publish --provenance --access public
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+
+      - name: Summarize
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          {
+            echo "### Published ${GITHUB_REF_NAME}"
+            echo ""
+            echo "- Package: dsh-plugin-discourse@$version"
+            echo "- npm: https://www.npmjs.com/package/dsh-plugin-discourse/v/$version"
+            echo "- Provenance: attached to the npm version page (build transparency log)"
+            echo "- Install: dsh plugin --profile desktop add dsh-plugin-discourse@$version"
+          } >> "$GITHUB_STEP_SUMMARY"

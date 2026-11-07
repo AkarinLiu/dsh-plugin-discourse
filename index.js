@@ -165,14 +165,16 @@ function day(value) {
 function readConfig(raw) {
   const source = raw !== null && typeof raw === 'object' ? raw : {}
   const declared = optionalString(source.baseUrl) ?? DEFAULT_BASE_URL
-  let baseUrl
+  let parsed
   try {
-    const parsed = new URL(declared)
-    if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') fail('unsupported protocol')
-    baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`
+    parsed = new URL(declared)
   } catch {
     fail(`invalid config: \`baseUrl\` must be an http(s) URL, got ${JSON.stringify(declared)}`)
   }
+  if (parsed.protocol !== 'https:' && parsed.protocol !== 'http:') {
+    fail(`invalid config: \`baseUrl\` must be an http(s) URL, got ${JSON.stringify(declared)}`)
+  }
+  const baseUrl = `${parsed.origin}${parsed.pathname.replace(/\/+$/, '')}`
   const envKey = typeof process !== 'undefined' ? process.env?.DISCOURSE_API_KEY : undefined
   const envUser = typeof process !== 'undefined' ? process.env?.DISCOURSE_API_USERNAME : undefined
   const apiKey = optionalString(source.apiKey) ?? optionalString(envKey) ?? ''

@@ -74,6 +74,18 @@ for (const [name, tool] of registry) {
   }
 }
 
+// A malformed forum URL must fail at activation with a usable diagnostic,
+// before any tool is registered.
+try {
+  apply({
+    tools: { register() { problems.push('invalid baseUrl registered a tool') } },
+    effect(callback) { callback() },
+  }, { baseUrl: 'ftp://forum.example.com' })
+  problems.push('invalid baseUrl was accepted')
+} catch (error) {
+  if (!/http\(s\) URL/.test(error.message)) problems.push(`invalid baseUrl diagnostic is unhelpful: ${error.message}`)
+}
+
 const describe = (value) => {
   const rendered = value.map((block) => block.text ?? `[${block.type}]`).join('\n')
   return rendered.length > 700 ? `${rendered.slice(0, 700)}…` : rendered
