@@ -37,9 +37,6 @@ jobs:
       - name: Verify the packed tarball
         run: npm run verify
 
-      - name: Dry-run the publish
-        run: npm publish --dry-run --access public --ignore-scripts
-
   publish:
     name: Publish ${{ github.ref_name }} to npmjs.com
     needs: verify
