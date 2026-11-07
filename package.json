@@ -1,0 +1,26 @@
+{
+  "name": "dsh-plugin-discourse",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "Discourse administration and agent tools for the DeepSeek Harness",
+  "license": "MIT",
+  "exports": {
+    ".": "./index.js",
+    "./locale/*.json": "./locale/*.json",
+    "./icon": "./icon.svg"
+  },
+  "files": [
+    "index.js",
+    "cordis.patch.yml",
+    "README.md",
+    "LICENSE",
+    "locale/*.json",
+    "icon.svg"
+  ],
+  "dsh": {
+    "bundle": {
+      "patch": "./cordis.patch.yml"
+    }
+  }
+}

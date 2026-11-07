@@ -1,0 +1,13 @@
+# Inserts the Discourse tool bundle into the current DSH profile.
+# Change `baseUrl` to your forum and point `apiKey` at an admin-scoped key
+# before enabling writes.
+- insert:
+    - id: discourse
+      name: dsh-plugin-discourse
+      config:
+        baseUrl: https://meta.discourse.org
+        apiKey: ''
+        apiUsername: ''
+        readOnly: false
+        timeoutMs: 20000
+        maxItems: 12
