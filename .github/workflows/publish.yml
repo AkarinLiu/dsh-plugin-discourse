@@ -50,8 +50,10 @@ jobs:
       - name: Check out
         uses: actions/checkout@v4
 
-      # Trusted publishing: npm exchanges the GitHub OIDC token for publish
-      # rights, so this job carries no long-lived npm token.
+      # npm has two ways to authenticate here. Trusted publishing exchanges the
+      # GitHub OIDC token (id-token: write, below) once the npm package lists
+      # this repository as a trusted publisher; the repository's NPM_TOKEN
+      # secret covers the window before that setting exists.
       - name: Set up Node.js
         uses: actions/setup-node@v4
         with:
@@ -66,8 +68,26 @@ jobs:
           fi
           echo "Publishing $version from tag ${GITHUB_REF_NAME}"
 
-      - name: Publish with provenance
+      - name: Publish with provenance (trusted publishing)
+        id: oidc
+        continue-on-error: true
         run: npm publish --provenance --access public
+
+      # ENEEDAUTH names the one fixable cause: no trusted publisher answers for
+      # this repository yet. Authenticate with the profile token instead, which
+      # is the same account, and let --provenance attest the build through the
+      # job's OIDC token.
+      - name: Publish with provenance (npm token fallback)
+        if: steps.oidc.outcome == 'failure'
+        env:
+          NODE_AUTH_TOKEN: ${{ secrets.NPM_TOKEN }}
+        run: |
+          if [ -z "$NODE_AUTH_TOKEN" ]; then
+            echo "::error::Trusted publishing failed and NPM_TOKEN is unset; add the trusted publisher on npmjs.com or set the repository secret."
+            exit 1
+          fi
+          npm config set //registry.npmjs.org/:_authToken "$NODE_AUTH_TOKEN"
+          npm publish --provenance --access public
 
       - name: Summarize
         run: |

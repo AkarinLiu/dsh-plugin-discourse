@@ -241,7 +241,7 @@ push to `main` or a `v*` tag, and every pull request, verifies the package, and 
 2. Commit, then tag and push:
 
    ```bash
-   git tag -a v1.0.1 -m "dsh-plugin-discourse 1.0.1"
+   git tag -a v1.1.0 -m "dsh-plugin-discourse 1.1.0"
    git push origin main --follow-tags
    ```
 
@@ -258,10 +258,12 @@ Before the first release, add a **Trusted Publisher** on npmjs.com (package page
 | Environment | *(leave empty)* |
 | Allowed action | `npm publish` |
 
-No `NPM_TOKEN` secret is needed: the workflow exchanges the GitHub OIDC token
-(`id-token: write`) for publish rights and attaches provenance. npm now requires an interactive 2FA
-challenge for token and trusted-publisher management, so this one-time setup happens in the browser;
-after it, tagged releases are fully automatic.
+With the trusted publisher in place the workflow needs no long-lived credential: it exchanges the
+GitHub OIDC token (`id-token: write`) for publish rights and attaches provenance. Until that setting
+exists, the publish job falls back to the repository's `NPM_TOKEN` secret, and it fails with a
+diagnostic when neither credential is available. npm now requires an interactive 2FA challenge for
+token and trusted-publisher management, so the one-time setup happens in the browser; after it, tagged
+releases are fully automatic.
 
 ## 中文说明
 
