@@ -68,6 +68,21 @@ jobs:
           fi
           echo "Publishing $version from tag ${GITHUB_REF_NAME}"
 
+      # Report the two facts a failed publish needs: whether npm got the OIDC
+      # context trusted publishing exchanges, and whether the fallback secret
+      # exists. Neither line reveals a credential.
+      - name: Check publish credentials
+        env:
+          NPM_TOKEN_PRESENT: ${{ secrets.NPM_TOKEN != '' }}
+        run: |
+          echo "npm: $(npm --version)"
+          if [ -n "$ACTIONS_ID_TOKEN_REQUEST_URL" ]; then
+            echo "OIDC: request URL is available to npm"
+          else
+            echo "OIDC: no request URL; npm cannot exchange a trusted-publishing token"
+          fi
+          echo "NPM_TOKEN secret present: $NPM_TOKEN_PRESENT"
+
       - name: Publish with provenance (trusted publishing)
         id: oidc
         continue-on-error: true
