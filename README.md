@@ -258,12 +258,12 @@ Before the first release, add a **Trusted Publisher** on npmjs.com (package page
 | Environment | *(leave empty)* |
 | Allowed action | `npm publish` |
 
-With the trusted publisher in place the workflow needs no long-lived credential: it exchanges the
-GitHub OIDC token (`id-token: write`) for publish rights and attaches provenance. Until that setting
-exists, the publish job falls back to the repository's `NPM_TOKEN` secret, and it fails with a
-diagnostic when neither credential is available. npm now requires an interactive 2FA challenge for
-token and trusted-publisher management, so the one-time setup happens in the browser; after it, tagged
-releases are fully automatic.
+No `NPM_TOKEN` secret is needed: the workflow exchanges the GitHub OIDC token
+(`id-token: write`) for publish rights and attaches provenance. npm now requires an interactive 2FA
+challenge for token and trusted-publisher management, so this one-time setup happens in the browser;
+after it, tagged releases are fully automatic. The publish job logs the npm version, whether the OIDC
+request URL reached it, and whether a `NPM_TOKEN` secret still exists, so a failed publish points at
+its cause.
 
 ## 中文说明
 
