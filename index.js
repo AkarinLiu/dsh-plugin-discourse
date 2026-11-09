@@ -2,12 +2,15 @@
  * Discourse administration and agent tools for the DeepSeek Harness.
  *
  * One Host plugin registers model-facing tools over the Discourse REST API:
- * reading topics and users, authoring posts, and running moderator/administrator
- * operations. Every request carries the configured API key, and `readOnly`
- * turns the plugin into an inspection-only surface.
+ * reading topics and users, authoring posts, running moderator/administrator
+ * operations, and signing in through the browser with a scoped user API key.
+ * Every request carries either the stored user session or the configured API
+ * key, and `readOnly` turns the plugin into an inspection-only surface.
  *
  * @module dsh-plugin-discourse
  */
+
+import { constants as cryptoConstants, generateKeyPairSync, privateDecrypt, randomBytes } from 'node:crypto'
 
 /** Loader row id used by this bundle. */
 export const name = 'discourse'
@@ -27,6 +30,16 @@ const MAX_LIMIT = 50
 const MAX_BODY = 700
 /** Hours a resolved category list stays trustworthy. */
 const CATEGORY_TTL_MS = 5 * 60 * 1000
+/** Credential record holding the browser-authorized user session. */
+const SESSION_KEY = 'discourse/session'
+/** Scopes requested by the browser sign-in when the config names none. */
+const DEFAULT_LOGIN_SCOPES = 'read,write,session_info'
+/** Application name shown on the forum authorization page. */
+const DEFAULT_LOGIN_APPLICATION = 'DeepSeek Harness'
+/** Client id Discourse stores with the authorized user API key. */
+const DEFAULT_LOGIN_CLIENT_ID = 'dsh-plugin-discourse'
+/** Browser sign-in deadline when the config names none (Discourse's device code lives 10 minutes). */
+const DEFAULT_LOGIN_TIMEOUT_MS = 10 * 60 * 1000
 
 /** Per-tool output schema: an open object, because each tool projects its own shape. */
 const OBJECT_OUTPUT = { type: 'object', additionalProperties: true }
@@ -157,10 +170,12 @@ function day(value) {
  * Normalize the loader row config into one resolved client configuration.
  *
  * The API key may come from the row config or from `DISCOURSE_API_KEY`, so a
- * shared profile file never needs to carry the secret itself.
+ * shared profile file never needs to carry the secret itself. Browser sign-in
+ * settings default to a scoped user API key that can read, write, and read the
+ * current session; a deployment may narrow the scopes.
  *
  * @param {unknown} raw - the loader row config object.
- * @returns {{ baseUrl: string, apiKey: string, apiUsername: string, readOnly: boolean, timeoutMs: number, maxItems: number }} the resolved configuration.
+ * @returns {{ baseUrl: string, apiKey: string, apiUsername: string, readOnly: boolean, timeoutMs: number, maxItems: number, authMode: 'auto' | 'api-key' | 'user', loginScopes: string[], loginClientId: string, loginApplicationName: string, loginTimeoutMs: number }} the resolved configuration.
  */
 function readConfig(raw) {
   const source = raw !== null && typeof raw === 'object' ? raw : {}
@@ -185,6 +200,19 @@ function readConfig(raw) {
   const maxItems = typeof source.maxItems === 'number' && Number.isFinite(source.maxItems)
     ? Math.min(MAX_LIMIT, Math.max(1, Math.round(source.maxItems)))
     : DEFAULT_LIMIT
+  const authMode = typeof source.authMode === 'string' ? source.authMode.trim().toLowerCase() : 'auto'
+  if (authMode !== 'auto' && authMode !== 'api-key' && authMode !== 'user') {
+    fail(`invalid config: \`authMode\` must be "auto", "api-key", or "user", got ${JSON.stringify(source.authMode)}`)
+  }
+  const loginScopes = readLoginScopes(source.loginScopes)
+  const loginClientId = optionalString(source.loginClientId) ?? DEFAULT_LOGIN_CLIENT_ID
+  const loginApplicationName = optionalString(source.loginApplicationName) ?? DEFAULT_LOGIN_APPLICATION
+  for (const [label, value] of [['loginClientId', loginClientId], ['loginApplicationName', loginApplicationName]]) {
+    if (Buffer.byteLength(value, 'utf8') > 200) fail(`invalid config: \`${label}\` must be at most 200 bytes`)
+  }
+  const loginTimeoutMs = typeof source.loginTimeoutMs === 'number' && Number.isFinite(source.loginTimeoutMs)
+    ? Math.min(1800000, Math.max(30000, Math.round(source.loginTimeoutMs)))
+    : DEFAULT_LOGIN_TIMEOUT_MS
   return {
     baseUrl,
     apiKey,
@@ -192,6 +220,111 @@ function readConfig(raw) {
     readOnly: source.readOnly === true,
     timeoutMs,
     maxItems,
+    authMode,
+    loginScopes,
+    loginClientId,
+    loginApplicationName,
+    loginTimeoutMs,
+  }
+}
+
+/**
+ * Normalize the scopes requested by browser sign-in.
+ * @param {unknown} value - a comma-separated string or an array of scope names.
+ * @returns {string[]} unique lowercase scope names.
+ */
+function readLoginScopes(value) {
+  const entries = Array.isArray(value) ? value : String(value ?? DEFAULT_LOGIN_SCOPES).split(',')
+  const scopes = []
+  for (const entry of entries) {
+    const scope = String(entry ?? '').trim().toLowerCase()
+    if (scope.length === 0) continue
+    if (!/^[a-z][a-z0-9_]*$/.test(scope)) fail(`invalid config: \`loginScopes\` contains an invalid scope ${JSON.stringify(entry)}`)
+    if (!scopes.includes(scope)) scopes.push(scope)
+  }
+  if (scopes.length === 0) fail('invalid config: `loginScopes` must name at least one scope')
+  if (scopes.length > 20) fail('invalid config: `loginScopes` names more than 20 scopes')
+  return scopes
+}
+
+// ---------------------------------------------------------------------------
+// Stored browser session
+// ---------------------------------------------------------------------------
+
+/**
+ * Validate one stored credential record and project it into a session.
+ *
+ * The record is owned by this plugin and addressed as `discourse/session`.
+ * A record for another forum, an unsupported version, or one without a key is
+ * reported as an error rather than used, so a changed `baseUrl` never sends the
+ * wrong forum's credential to a new host.
+ *
+ * @param {unknown} record - `credentials.readRecord()` result.
+ * @param {ReturnType<typeof readConfig>} config - resolved configuration.
+ * @returns {{ session?: Record<string, any>, error?: string }} the validated session or a diagnostic.
+ */
+function readSessionRecord(record, config) {
+  if (record === undefined || record === null) return {}
+  if (record.kind !== 'grant' || record.payload === null || typeof record.payload !== 'object') {
+    return { error: 'the stored Discourse sign-in is not a grant record' }
+  }
+  const payload = record.payload
+  if (payload.version !== 1) return { error: `the stored Discourse sign-in uses unsupported version ${JSON.stringify(payload.version)}` }
+  if (payload.baseUrl !== config.baseUrl) return { error: `the stored Discourse sign-in belongs to ${JSON.stringify(payload.baseUrl)}` }
+  if (typeof payload.key !== 'string' || payload.key.length === 0) return { error: 'the stored Discourse sign-in has no user API key' }
+  const expiresAt = typeof payload.expiresAt === 'string' && payload.expiresAt.length > 0 ? payload.expiresAt : null
+  const expiresAtMs = expiresAt === null ? Number.NaN : Date.parse(expiresAt)
+  if (expiresAt !== null && !Number.isFinite(expiresAtMs)) {
+    return { error: `the stored Discourse sign-in has an invalid expiry ${JSON.stringify(expiresAt)}` }
+  }
+  const expired = Number.isFinite(expiresAtMs) && expiresAtMs <= Date.now()
+  return {
+    session: {
+      key: payload.key,
+      username: typeof payload.username === 'string' && payload.username.length > 0 ? payload.username : null,
+      clientId: typeof payload.clientId === 'string' && payload.clientId.length > 0 ? payload.clientId : config.loginClientId,
+      scopes: Array.isArray(payload.scopes) ? payload.scopes.filter((scope) => typeof scope === 'string') : [],
+      apiVersion: typeof payload.apiVersion === 'number' ? payload.apiVersion : null,
+      source: typeof payload.source === 'string' ? payload.source : null,
+      createdAt: typeof payload.createdAt === 'string' ? payload.createdAt : null,
+      expiresAt,
+      expired,
+    },
+  }
+}
+
+/**
+ * Read and validate the stored browser session.
+ * @param {any} credentials - the credential service, when the profile provides one.
+ * @param {ReturnType<typeof readConfig>} config - resolved configuration.
+ * @returns {Promise<{ storageAvailable: boolean, session?: Record<string, any>, error?: string }>} the read result.
+ */
+async function readStoredSession(credentials, config) {
+  if (credentials === undefined || credentials === null) return { storageAvailable: false }
+  let record
+  try {
+    record = await credentials.readRecord(SESSION_KEY)
+  } catch (error) {
+    return { storageAvailable: true, error: `could not read the stored Discourse sign-in: ${error instanceof Error ? error.message : String(error)}` }
+  }
+  return { storageAvailable: true, ...readSessionRecord(record, config) }
+}
+
+/**
+ * Project a session onto the fields a tool may show.
+ * @param {Record<string, any>} session - validated session.
+ * @returns {Record<string, unknown>} the public session view, without the key.
+ */
+function publicSession(session) {
+  return {
+    username: session.username,
+    clientId: session.clientId,
+    scopes: session.scopes,
+    apiVersion: session.apiVersion,
+    source: session.source,
+    createdAt: session.createdAt,
+    expiresAt: session.expiresAt,
+    expired: session.expired === true,
   }
 }
 
@@ -202,16 +335,68 @@ function readConfig(raw) {
 /**
  * Build the request client shared by every tool of one activation.
  * @param {ReturnType<typeof readConfig>} config - resolved configuration.
+ * @param {() => any} [getCredentials] - resolves the credential service on demand.
  * @returns {{ call: Function, writable: Function, categories: Function, resolveCategory: Function, config: object }} the client.
  */
-function createClient(config) {
+function createClient(config, getCredentials = () => undefined) {
   const cache = { at: 0, entries: [] }
+
+  /**
+   * Read the stored browser session for request authentication.
+   * @returns {Promise<Record<string, any> | undefined>} a non-expired session for this forum.
+   */
+  async function readSession() {
+    const credentials = getCredentials()
+    if (credentials === undefined || credentials === null) return undefined
+    try {
+      const record = await credentials.readRecord(SESSION_KEY)
+      const projected = readSessionRecord(record, config)
+      if (projected.session !== undefined && projected.session.expired !== true) return projected.session
+    } catch {
+      // A storage failure falls back to the configured API key or anonymous reads.
+    }
+    return undefined
+  }
+
+  /**
+   * Compose request authorization for one operation.
+   * @param {{ anonymous?: boolean, privileged?: boolean, userApiKey?: string }} options - caller intent.
+   * @returns {Promise<Record<string, string>>} the authorization headers.
+   */
+  async function authHeaders(options) {
+    if (typeof options.userApiKey === 'string' && options.userApiKey.length > 0) {
+      return { 'User-Api-Key': options.userApiKey }
+    }
+    if (options.anonymous === true) return {}
+    const apiHeaders = config.apiKey.length > 0
+      ? { 'Api-Key': config.apiKey, 'Api-Username': config.apiUsername }
+      : {}
+    if (config.authMode === 'api-key') return apiHeaders
+    const session = await readSession()
+    if (config.authMode === 'user') {
+      if (session === undefined) {
+        fail('Discourse browser sign-in is required by `authMode: user`, but no valid session is stored. Run discourse_login with action "start".')
+      }
+      return {
+        'User-Api-Key': session.key,
+        ...(session.clientId.length > 0 ? { 'User-Api-Client-Id': session.clientId } : {}),
+      }
+    }
+    if (options.privileged === true && config.apiKey.length > 0) return apiHeaders
+    if (session !== undefined) {
+      return {
+        'User-Api-Key': session.key,
+        ...(session.clientId.length > 0 ? { 'User-Api-Client-Id': session.clientId } : {}),
+      }
+    }
+    return apiHeaders
+  }
 
   /**
    * Issue one Discourse request and decode its JSON body.
    * @param {string} method - HTTP method.
    * @param {string} path - absolute path such as `/latest.json`.
-   * @param {{ query?: Record<string, unknown>, body?: unknown, signal?: AbortSignal }} [options] - query values, JSON body, and caller cancellation.
+   * @param {{ query?: Record<string, unknown>, body?: unknown, signal?: AbortSignal, anonymous?: boolean, privileged?: boolean, userApiKey?: string }} [options] - query values, JSON body, caller cancellation, and authentication intent.
    * @returns {Promise<any>} the decoded body, or text for non-JSON responses.
    */
   async function call(method, path, options = {}) {
@@ -224,11 +409,7 @@ function createClient(config) {
     const suffix = search.size > 0 ? `?${search.toString()}` : ''
     const url = `${config.baseUrl}${path}${suffix}`
 
-    const headers = { Accept: 'application/json' }
-    if (config.apiKey.length > 0) {
-      headers['Api-Key'] = config.apiKey
-      headers['Api-Username'] = config.apiUsername
-    }
+    const headers = { Accept: 'application/json', ...(await authHeaders(options)) }
     if (options.body !== undefined) headers['Content-Type'] = 'application/json'
 
     const deadline = AbortSignal.timeout(config.timeoutMs)
@@ -251,6 +432,7 @@ function createClient(config) {
       fail(`Discourse request failed: ${method} ${path} (${reason})`)
     }
 
+    const usedSession = headers['User-Api-Key'] !== undefined
     const text = await response.text()
     let payload
     try {
@@ -261,11 +443,17 @@ function createClient(config) {
 
     if (!response.ok) {
       const detail = describeError(payload)
-      const hint = response.status === 403
-        ? ' The API key needs an admin-scoped key for this endpoint.'
-        : response.status === 404
-          ? ' Check that the forum URL and the target id are correct.'
-          : ''
+      const hint = response.status === 401 && usedSession
+        ? ' The stored Discourse session was rejected; run discourse_login with action "start" to sign in again.'
+        : response.status === 403
+          ? options.anonymous === true
+            ? ' The forum rejected anonymous user API key authorization; check that user API keys are enabled and the requested scopes are allowed.'
+            : usedSession
+              ? ' The signed-in user API key may lack the scope this endpoint needs; staff and admin endpoints require the configured apiKey.'
+              : ' The API key needs an admin-scoped key for this endpoint.'
+          : response.status === 404
+            ? ' Check that the forum URL and the target id are correct.'
+            : ''
       fail(`Discourse ${method} ${path} failed (HTTP ${response.status}): ${detail}${hint}`)
     }
     return payload
@@ -336,6 +524,880 @@ function createClient(config) {
   }
 
   return { call, writable, categories, resolveCategory, config }
+}
+
+// ---------------------------------------------------------------------------
+// Browser authorization login
+// ---------------------------------------------------------------------------
+
+/**
+ * Locate one service without requiring it at activation.
+ * @param {any} context - a Cordis context or the smoke test's stub.
+ * @param {string} name - service name.
+ * @returns {any} the service, or undefined when the profile does not provide it.
+ */
+function getService(context, name) {
+  if (context === undefined || context === null) return undefined
+  if (typeof context.get === 'function') {
+    try {
+      return context.get(name)
+    } catch {
+      return undefined
+    }
+  }
+  return context[name]
+}
+
+/**
+ * Resolve after a delay, rejecting when the caller's signal is withdrawn.
+ * @param {number} ms - delay in milliseconds.
+ * @param {AbortSignal} [signal] - attempt cancellation.
+ * @returns {Promise<void>} resolves after the delay.
+ */
+function sleep(ms, signal) {
+  return new Promise((resolve, reject) => {
+    if (signal?.aborted === true) {
+      reject(new Error('the Discourse sign-in attempt was cancelled'))
+      return
+    }
+    const timer = setTimeout(() => {
+      cleanup()
+      resolve()
+    }, ms)
+    const onAbort = () => {
+      cleanup()
+      reject(new Error('the Discourse sign-in attempt was cancelled'))
+    }
+    function cleanup() {
+      clearTimeout(timer)
+      signal?.removeEventListener('abort', onAbort)
+    }
+    signal?.addEventListener('abort', onAbort, { once: true })
+  })
+}
+
+/**
+ * Race one promise against a deadline without leaving a live timer behind.
+ * @param {Promise<any>} promise - the operation to bound.
+ * @param {number} ms - deadline in milliseconds.
+ * @returns {Promise<any>} the operation's value.
+ */
+function withTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error('timed out waiting for Discourse')), ms)
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
+/**
+ * Race one promise against a deadline, resolving undefined on timeout and
+ * clearing the deadline timer when the operation settles first.
+ * @param {Promise<any>} promise - the operation to bound.
+ * @param {number} ms - deadline in milliseconds.
+ * @returns {Promise<any>} the operation's value, or undefined on timeout.
+ */
+function raceTimeout(promise, ms) {
+  return new Promise((resolve, reject) => {
+    const timer = setTimeout(() => resolve(undefined), ms)
+    Promise.resolve(promise).then(
+      (value) => {
+        clearTimeout(timer)
+        resolve(value)
+      },
+      (error) => {
+        clearTimeout(timer)
+        reject(error)
+      },
+    )
+  })
+}
+
+/**
+ * Whether a device-authorization request failed because the forum predates it.
+ * @param {unknown} error - request failure.
+ * @returns {boolean} true when the classic flow should be attempted.
+ */
+function isMissingDeviceRoute(error) {
+  const message = error instanceof Error ? error.message : String(error)
+  return /HTTP (?:404|405|501)\b/.test(message)
+}
+
+/**
+ * Extract a Discourse encrypted payload from a pasted value.
+ *
+ * The classic authorization page shows the payload as text; a redirect URL
+ * carries it as `?payload=…`, and a copied JSON response carries the same
+ * field. All three shapes are accepted, including a whole page whose longest
+ * Base64 run is the payload.
+ *
+ * @param {unknown} input - payload text, JSON, or URL supplied by the user.
+ * @returns {string} the Base64 ciphertext.
+ */
+function extractEncryptedPayload(input) {
+  let text = requiredString(input, 'payload')
+  if (/^[{[]/.test(text)) {
+    try {
+      const parsed = JSON.parse(text)
+      if (typeof parsed?.payload === 'string') text = parsed.payload
+    } catch {
+      // Not JSON; keep looking for a URL or Base64 text.
+    }
+  }
+  const queryMatch = /[?&]payload=([^&\s]+)/.exec(text)
+  if (queryMatch !== null) {
+    try {
+      text = decodeURIComponent(queryMatch[1])
+    } catch {
+      text = queryMatch[1]
+    }
+  }
+  const compact = text.replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/')
+  if (compact.length >= 60 && /^[A-Za-z0-9+/=]+$/.test(compact)) return compact
+  const candidates = text.match(/[A-Za-z0-9+/=_-]{60,}/g) ?? []
+  if (candidates.length === 0) {
+    fail('invalid payload: paste the encrypted payload that Discourse shows after you approve, or the full redirect URL')
+  }
+  const longest = candidates.reduce((best, candidate) => (candidate.length > best.length ? candidate : best), '')
+  return longest.replace(/-/g, '+').replace(/_/g, '/')
+}
+
+/**
+ * Decrypt one Discourse user API key payload with the attempt's private key.
+ * @param {string} privateKey - PEM-encoded private key generated for the attempt.
+ * @param {string} payload - Base64 ciphertext from the poll or the clipboard.
+ * @returns {Record<string, any>} the decrypted payload with `key` and `nonce`.
+ */
+function decryptLoginPayload(privateKey, payload) {
+  const normalized = String(payload ?? '').replace(/\s+/g, '').replace(/-/g, '+').replace(/_/g, '/')
+  if (normalized.length === 0) fail('invalid payload: the encrypted payload is empty')
+  const ciphertext = Buffer.from(normalized, 'base64')
+  let lastError
+  for (const options of [
+    { padding: cryptoConstants.RSA_PKCS1_OAEP_PADDING, oaepHash: 'sha1' },
+    { padding: cryptoConstants.RSA_PKCS1_PADDING },
+  ]) {
+    try {
+      const plaintext = privateDecrypt({ key: privateKey, ...options }, ciphertext).toString('utf8')
+      const parsed = JSON.parse(plaintext)
+      if (parsed !== null && typeof parsed === 'object' && typeof parsed.key === 'string' && parsed.key.length > 0) return parsed
+      lastError = new Error('the decrypted payload carries no user API key')
+    } catch (error) {
+      lastError = error
+    }
+  }
+  const reason = lastError instanceof Error ? lastError.message : String(lastError)
+  fail(`could not decrypt the Discourse authorization payload (${reason}); start the sign-in again`)
+}
+
+/**
+ * Build the classic user API key authorization URL.
+ *
+ * The classic page predates the device flow, so it is also the compatibility
+ * path for older forums. It deliberately omits `padding`: those forums may not
+ * know the parameter and use PKCS#1, while `decryptLoginPayload` accepts either
+ * padding mode. The device flow, which targets current forums, always uses OAEP.
+ *
+ * @param {ReturnType<typeof readConfig>} config - resolved configuration.
+ * @param {{ publicKey: string, nonce: string, scopes: string[] }} plan - attempt key material and scopes.
+ * @returns {string} the authorization page URL.
+ */
+function buildManualLoginUrl(config, plan) {
+  const query = new URLSearchParams({
+    application_name: config.loginApplicationName,
+    client_id: config.loginClientId,
+    nonce: plan.nonce,
+    scopes: plan.scopes.join(','),
+    public_key: plan.publicKey,
+  })
+  return `${config.baseUrl}/user-api-key/new?${query.toString()}`
+}
+
+/**
+ * Build the browser sign-in controller for one plugin activation.
+ *
+ * The controller owns the current attempt, the interaction a tool call sees,
+ * and the credential record read by the HTTP client. Discourse's device flow
+ * (Auth API v4) is preferred; a forum without it falls back to the classic
+ * page whose encrypted payload the user pastes back.
+ *
+ * @param {any} ctx - plugin context.
+ * @param {ReturnType<typeof readConfig>} config - resolved configuration.
+ * @param {ReturnType<typeof createClient>} client - request client.
+ * @returns {{ attach: Function, start: Function, status: Function, complete: Function, cancel: Function, logout: Function, waitFor: Function, dispose: Function }} the controller.
+ */
+function createLogin(ctx, config, client) {
+  /** Credential and authorization services, once their provider is mounted. */
+  let services
+  /** The attempt started by this plugin, including its interaction surface. */
+  let attempt
+  /** Key material and mode for the attempt currently running through the authorization seam. */
+  let activePlan
+  let disposed = false
+  let attachError
+
+  const host = (() => {
+    try {
+      return new URL(config.baseUrl).host
+    } catch {
+      return config.baseUrl
+    }
+  })()
+  const flowLabel = `Discourse (${host})`
+
+  /**
+   * Offer the sign-in flow to the authorization service.
+   * @param {any} scope - context carrying `credentials` and `authorization`.
+   * @returns {boolean} whether the flow is registered.
+   */
+  function attach(scope) {
+    if (disposed) return false
+    if (services !== undefined) return true
+    const credentials = getService(scope, 'credentials')
+    const authorization = getService(scope, 'authorization')
+    if (credentials === undefined || authorization === undefined) return false
+    const flow = {
+      key: SESSION_KEY,
+      label: flowLabel,
+      methods: [{ id: 'browser', label: 'Sign in with browser' }],
+      run: (session) => run(session),
+    }
+    let disposeFlow
+    try {
+      disposeFlow = authorization.registerFlow(flow)
+    } catch (error) {
+      attachError = error instanceof Error ? error.message : String(error)
+      return false
+    }
+    const attached = { credentials, authorization }
+    services = attached
+    const effectHost = typeof scope.effect === 'function' ? scope : ctx
+    if (typeof effectHost?.effect === 'function') {
+      effectHost.effect(() => () => {
+        disposeFlow()
+        if (services === attached) services = undefined
+      }, 'discourse:authorization flow')
+    }
+    return true
+  }
+
+  /**
+   * Fail unless the credential store and authorization seam are available.
+   * @returns {{ credentials: any, authorization: any }} the services.
+   */
+  function requireServices() {
+    if (disposed) fail('the Discourse plugin is shutting down')
+    if (services !== undefined) return services
+    if (!attach(ctx)) {
+      fail(attachError !== undefined
+        ? `Discourse browser sign-in is unavailable: ${attachError}`
+        : 'Discourse browser sign-in needs the DSH credential store and authorization service. This profile does not provide them.')
+    }
+    return services
+  }
+
+  /**
+   * Generate the per-attempt RSA key pair and nonce.
+   * @param {string[]} scopes - scopes to request.
+   * @param {'auto' | 'device' | 'manual'} mode - transport preference.
+   * @returns {{ publicKey: string, privateKey: string, nonce: string, scopes: string[], mode: string }} the attempt plan.
+   */
+  function createPlan(scopes, mode) {
+    const { publicKey, privateKey } = generateKeyPairSync('rsa', {
+      modulusLength: 2048,
+      publicKeyEncoding: { type: 'spki', format: 'pem' },
+      privateKeyEncoding: { type: 'pkcs8', format: 'pem' },
+    })
+    return {
+      publicKey,
+      privateKey,
+      nonce: randomBytes(32).toString('hex'),
+      scopes: [...scopes],
+      mode,
+    }
+  }
+
+  /**
+   * Read the approving account's username without making sign-in depend on it.
+   * @param {string} key - freshly issued user API key.
+   * @param {AbortSignal} signal - attempt cancellation.
+   * @returns {Promise<Record<string, any> | undefined>} the account, or undefined when the scope cannot read it.
+   */
+  async function readLoginProfile(key, signal) {
+    try {
+      const payload = await client.call('GET', '/session/current.json', { userApiKey: key, signal })
+      const current = payload?.current_user ?? payload?.user
+      return current !== null && typeof current === 'object' ? current : undefined
+    } catch (error) {
+      // A 401 means the freshly issued key is unusable; do not store it. A
+      // missing `session_info` scope (403) only costs the friendly username.
+      if (/HTTP 401\b/.test(error instanceof Error ? error.message : String(error))) throw error
+      return undefined
+    }
+  }
+
+  /**
+   * Validate and commit one decrypted payload through the authorization seam.
+   * @param {any} session - authorization session.
+   * @param {{ nonce: string, scopes: string[] }} plan - attempt plan.
+   * @param {Record<string, any>} data - decrypted payload.
+   * @param {'device' | 'manual'} source - which browser path produced it.
+   * @returns {Promise<void>} resolves after the credential record is stored.
+   */
+  async function commitSession(session, plan, data, source) {
+    if (typeof data.nonce !== 'string' || data.nonce !== plan.nonce) {
+      fail('the Discourse authorization payload nonce did not match this attempt; start the sign-in again')
+    }
+    if (typeof data.key !== 'string' || data.key.length === 0) {
+      fail('the Discourse authorization payload carried no user API key')
+    }
+    const profile = await readLoginProfile(data.key, session.signal)
+    await session.commit({
+      kind: 'grant',
+      payload: {
+        version: 1,
+        baseUrl: config.baseUrl,
+        key: data.key,
+        username: typeof profile?.username === 'string' && profile.username.length > 0 ? profile.username : null,
+        clientId: config.loginClientId,
+        scopes: [...plan.scopes],
+        apiVersion: typeof data.api === 'number' ? data.api : null,
+        createdAt: new Date().toISOString(),
+        expiresAt: typeof data.expires_at === 'string' && data.expires_at.length > 0 ? data.expires_at : null,
+        source,
+      },
+    })
+  }
+
+  /**
+   * Run Discourse's device authorization flow: request a code, notify the
+   * browser destination, poll, decrypt, and commit.
+   * @param {any} session - authorization session.
+   * @param {any} plan - attempt plan.
+   * @returns {Promise<void>} resolves after sign-in.
+   */
+  async function runDevice(session, plan) {
+    let request
+    try {
+      request = await client.call('POST', '/user-api-key/device.json', {
+        body: {
+          nonce: plan.nonce,
+          scopes: plan.scopes.join(','),
+          client_id: config.loginClientId,
+          application_name: config.loginApplicationName,
+          public_key: plan.publicKey,
+          padding: 'oaep',
+        },
+        anonymous: true,
+        signal: session.signal,
+      })
+    } catch (error) {
+      if (plan.mode === 'auto' && isMissingDeviceRoute(error)) return runManual(session, plan)
+      throw error
+    }
+    if (typeof request?.device_code !== 'string' || request.device_code.length === 0) {
+      if (plan.mode === 'auto') return runManual(session, plan)
+      fail('Discourse did not return a device authorization code')
+    }
+    const deviceCode = request.device_code
+    const rawUrl = optionalString(request.verification_uri_with_request) ?? optionalString(request.verification_uri)
+    if (rawUrl === undefined) fail('Discourse did not return a verification URL for the device authorization code')
+    let verificationUrl
+    try {
+      verificationUrl = new URL(rawUrl, config.baseUrl).href
+    } catch {
+      fail(`Discourse returned an invalid verification URL: ${JSON.stringify(rawUrl)}`)
+    }
+    const userCode = optionalString(request.user_code)
+    const expiresIn = typeof request.expires_in === 'number' && Number.isFinite(request.expires_in) && request.expires_in > 0
+      ? request.expires_in
+      : 600
+    const interval = Math.max(1, Math.min(30, typeof request.interval === 'number' && Number.isFinite(request.interval) ? request.interval : 5))
+    const deadline = Math.min(Date.now() + config.loginTimeoutMs, Date.now() + expiresIn * 1000)
+    session.notify({
+      message: userCode === undefined
+        ? `Open ${verificationUrl} and approve the sign-in for ${host}.`
+        : `Open ${verificationUrl} and confirm the code ${userCode} to sign in to ${host}.`,
+      url: verificationUrl,
+      ...(userCode === undefined ? {} : { code: userCode }),
+    })
+    let failures = 0
+    for (;;) {
+      if (Date.now() >= deadline) fail('the Discourse device authorization code expired before it was approved; start the sign-in again')
+      await sleep(interval * 1000, session.signal)
+      let result
+      try {
+        result = await client.call('POST', '/user-api-key/device/poll.json', {
+          body: { device_code: deviceCode },
+          anonymous: true,
+          signal: session.signal,
+        })
+        failures = 0
+      } catch (error) {
+        if (session.signal.aborted === true) throw error
+        if (/HTTP 429\b/.test(error instanceof Error ? error.message : String(error))) {
+          await sleep(interval * 2000, session.signal)
+          continue
+        }
+        failures += 1
+        if (failures >= 3) throw error
+        continue
+      }
+      const status = result?.status
+      if (status === 'authorization_pending') continue
+      if (status === 'authorized') {
+        if (typeof result?.payload !== 'string' || result.payload.length === 0) {
+          fail('Discourse authorized the sign-in but returned no encrypted payload')
+        }
+        const data = decryptLoginPayload(plan.privateKey, result.payload)
+        await commitSession(session, plan, data, 'device')
+        return
+      }
+      if (status === 'access_denied') fail('the Discourse authorization request was denied in the browser')
+      if (status === 'expired_token') fail('the Discourse device authorization code expired; start the sign-in again')
+      fail(`Discourse returned an unexpected device authorization status ${JSON.stringify(status)}`)
+    }
+  }
+
+  /**
+   * Run the classic user API key page and finish from the pasted payload.
+   * @param {any} session - authorization session.
+   * @param {any} plan - attempt plan.
+   * @returns {Promise<void>} resolves after sign-in.
+   */
+  async function runManual(session, plan) {
+    const url = buildManualLoginUrl(config, plan)
+    session.notify({
+      message: `Open ${url}, approve the request, then copy the encrypted payload that Discourse shows and paste it back here.`,
+      url,
+    })
+    const pasted = await session.prompt({
+      kind: 'text',
+      message: 'Paste the encrypted payload that Discourse showed after you approved the request.',
+    })
+    const payload = extractEncryptedPayload(pasted)
+    const data = decryptLoginPayload(plan.privateKey, payload)
+    await commitSession(session, plan, data, 'manual')
+  }
+
+  /**
+   * Run one authorization attempt for whichever surface started it.
+   * @param {any} session - authorization session supplied by the seam.
+   * @returns {Promise<void>} resolves after the credential record is committed.
+   */
+  async function run(session) {
+    if (disposed) fail('the Discourse plugin is shutting down')
+    const plan = activePlan ?? createPlan(config.loginScopes, 'auto')
+    if (activePlan === undefined) activePlan = plan
+    try {
+      if (plan.mode === 'manual') return await runManual(session, plan)
+      return await runDevice(session, plan)
+    } finally {
+      if (activePlan === plan) activePlan = undefined
+    }
+  }
+
+  /**
+   * Project the active attempt onto safe status fields.
+   * @returns {Record<string, unknown> | undefined} the attempt view.
+   */
+  function publicAttempt() {
+    if (attempt === undefined) return undefined
+    const view = {
+      status: attempt.state,
+      startedAt: attempt.startedAt,
+      expiresAt: attempt.expiresAt,
+    }
+    if (attempt.mode !== undefined) view.mode = attempt.mode
+    if (attempt.url !== undefined) view.url = attempt.url
+    if (attempt.userCode !== undefined) view.userCode = attempt.userCode
+    if (attempt.message !== undefined) view.message = attempt.message
+    if (attempt.prompt !== undefined) view.prompt = attempt.prompt
+    if (attempt.error !== undefined) view.error = attempt.error
+    if (attempt.abortReason === 'timeout' && attempt.state !== 'authorized') view.status = 'expired'
+    return view
+  }
+
+  /**
+   * Build the safe status the tool reports.
+   * @returns {Promise<Record<string, unknown>>} sign-in state, active credential source, and any attempt.
+   */
+  async function status() {
+    const credentials = services?.credentials ?? getService(ctx, 'credentials')
+    const read = await readStoredSession(credentials, config)
+    const session = read.session !== undefined && read.session.expired !== true ? read.session : undefined
+    const apiKeyConfigured = config.apiKey.length > 0
+    let activeSource = 'anonymous'
+    if (config.authMode === 'api-key') activeSource = apiKeyConfigured ? 'api-key' : 'anonymous'
+    else if (config.authMode === 'user') activeSource = session === undefined ? 'none' : 'user-session'
+    else activeSource = session !== undefined ? 'user-session' : apiKeyConfigured ? 'api-key' : 'anonymous'
+    const staffSource = config.authMode === 'user'
+      ? (session === undefined ? 'none' : 'user-session')
+      : config.authMode === 'api-key'
+        ? (apiKeyConfigured ? 'api-key' : 'anonymous')
+        : (session !== undefined && apiKeyConfigured ? 'api-key' : activeSource)
+    return {
+      baseUrl: config.baseUrl,
+      authMode: config.authMode,
+      signedIn: session !== undefined,
+      storageAvailable: read.storageAvailable,
+      apiKeyConfigured,
+      activeSource,
+      staffSource,
+      ...(session === undefined ? {} : { session: publicSession(session) }),
+      ...(read.session?.expired === true ? { sessionExpired: true } : {}),
+      ...(read.error === undefined ? {} : { sessionError: read.error }),
+      ...(attempt === undefined ? {} : { attempt: publicAttempt() }),
+      ...(config.authMode === 'user' && session === undefined
+        ? { warning: 'authMode is "user" but no valid browser session is stored; run discourse_login with action "start".' }
+        : {}),
+    }
+  }
+
+  /**
+   * Reject a pending prompt and release the attempt timer without cancelling
+   * another surface's flow.
+   * @returns {void}
+   */
+  function discardAttempt() {
+    if (attempt === undefined) return
+    if (attempt.timer !== undefined) clearTimeout(attempt.timer)
+    if (typeof attempt.promptReject === 'function') {
+      try {
+        attempt.promptReject(new Error('the Discourse sign-in attempt ended'))
+      } catch {
+        // The prompt was already settled.
+      }
+    }
+    attempt = undefined
+    activePlan = undefined
+  }
+
+  /**
+   * Finish an attempt, keeping its outcome for the next status call.
+   * @param {{ state: string, error?: string }} next - outcome fields.
+   * @returns {void}
+   */
+  function finishAttempt(next) {
+    if (attempt === undefined) return
+    attempt.state = next.state
+    if (next.error !== undefined) attempt.error = next.error
+    if (attempt.timer !== undefined) clearTimeout(attempt.timer)
+    attempt.timer = undefined
+    if (typeof attempt.promptReject === 'function') {
+      try {
+        attempt.promptReject(new Error('the Discourse sign-in attempt ended'))
+      } catch {
+        // The prompt was already settled.
+      }
+    }
+    attempt.promptResolve = undefined
+    attempt.promptReject = undefined
+    activePlan = undefined
+  }
+
+  /**
+   * Cancel the active attempt and the seam's running flow.
+   * @returns {void}
+   */
+  function clearAttempt() {
+    if (attempt === undefined) return
+    const controller = attempt.controller
+    discardAttempt()
+    if (services?.authorization !== undefined) {
+      try {
+        services.authorization.cancel(SESSION_KEY)
+      } catch {
+        // The seam may already have released the key.
+      }
+    }
+    if (controller !== undefined && controller.signal.aborted !== true) {
+      try {
+        controller.abort()
+      } catch {
+        // An already aborted controller is harmless.
+      }
+    }
+  }
+
+  /**
+   * Start a browser sign-in, or report the existing session/attempt.
+   * @param {{ scopes?: string | string[], force?: boolean, mode?: 'auto' | 'device' | 'manual' }} [options] - requested scopes, restart, and transport preference.
+   * @returns {Promise<Record<string, unknown>>} status including the verification URL when pending.
+   */
+  async function start(options = {}) {
+    const { authorization } = requireServices()
+    const mode = options.mode === undefined ? 'auto' : String(options.mode).toLowerCase()
+    if (mode !== 'auto' && mode !== 'device' && mode !== 'manual') fail('invalid arguments: `mode` must be "auto", "device", or "manual"')
+    if (options.force !== true) {
+      const current = await status()
+      if (current.signedIn === true) return { ...current, alreadySignedIn: true }
+    }
+    if (attempt !== undefined && (attempt.state === 'pending' || attempt.state === 'starting')) return status()
+    if (attempt !== undefined) clearAttempt()
+    const scopes = options.scopes === undefined ? config.loginScopes : readLoginScopes(options.scopes)
+    let plan
+    try {
+      plan = createPlan(scopes, mode)
+    } catch (error) {
+      fail(`could not generate the browser sign-in key pair: ${error instanceof Error ? error.message : String(error)}`)
+    }
+    const controller = new AbortController()
+    let resolveStarted
+    const started = new Promise((resolve) => {
+      resolveStarted = resolve
+    })
+    const currentAttempt = {
+      state: 'starting',
+      startedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + config.loginTimeoutMs).toISOString(),
+      controller,
+      timer: undefined,
+      url: undefined,
+      userCode: undefined,
+      message: undefined,
+      mode: mode === 'manual' ? 'manual' : mode === 'device' ? 'device' : undefined,
+      prompt: undefined,
+      promptResolve: undefined,
+      promptReject: undefined,
+      error: undefined,
+      abortReason: undefined,
+      promise: undefined,
+    }
+    attempt = currentAttempt
+    activePlan = plan
+    currentAttempt.timer = setTimeout(() => {
+      currentAttempt.abortReason = 'timeout'
+      controller.abort()
+    }, config.loginTimeoutMs)
+    currentAttempt.timer.unref?.()
+    const interaction = {
+      notify(notice) {
+        if (typeof notice?.url === 'string' && notice.url.length > 0) {
+          currentAttempt.url = notice.url
+          currentAttempt.mode = /\/user-api-key\/activate(?:[?#]|$)/.test(notice.url) ? 'device' : 'manual'
+        }
+        if (typeof notice?.message === 'string') currentAttempt.message = notice.message
+        if (typeof notice?.code === 'string') currentAttempt.userCode = notice.code
+        currentAttempt.state = 'pending'
+        resolveStarted()
+      },
+      prompt(question) {
+        currentAttempt.mode = 'manual'
+        currentAttempt.state = 'pending'
+        if (typeof question?.message === 'string') currentAttempt.prompt = question.message
+        resolveStarted()
+        return new Promise((resolve, reject) => {
+          currentAttempt.promptResolve = resolve
+          currentAttempt.promptReject = reject
+        })
+      },
+    }
+    let beginPromise
+    try {
+      beginPromise = authorization.begin({ key: SESSION_KEY, signal: controller.signal, interaction })
+    } catch (error) {
+      discardAttempt()
+      throw error
+    }
+    currentAttempt.promise = beginPromise
+    const early = beginPromise.then((outcome) => ({ outcome }), (error) => ({ error }))
+    void early.then((result) => {
+      resolveStarted()
+      if (attempt !== currentAttempt) return
+      if (result.error !== undefined) {
+        if (result.error?.code === 'ALREADY_IN_FLIGHT') {
+          discardAttempt()
+          return
+        }
+        finishAttempt({ state: 'failed', error: result.error instanceof Error ? result.error.message : String(result.error) })
+        return
+      }
+      if (result.outcome?.status === 'authorized') {
+        finishAttempt({ state: 'authorized' })
+      } else {
+        finishAttempt({ state: currentAttempt.abortReason === 'timeout' ? 'expired' : 'cancelled' })
+      }
+    })
+    const first = await raceTimeout(Promise.race([started.then(() => 'started'), early]), 15000)
+    if (first !== 'started' && first?.error !== undefined) {
+      if (first.error?.code === 'ALREADY_IN_FLIGHT') {
+        discardAttempt()
+        fail('another Discourse browser sign-in is already in progress; finish or cancel it before starting a new one')
+      }
+      fail(first.error instanceof Error ? first.error.message : String(first.error))
+    }
+    const current = await status()
+    if (current.attempt?.status === 'failed') fail(String(current.attempt.error ?? 'Discourse browser sign-in failed'))
+    if (first?.outcome?.status === 'cancelled') {
+      fail(currentAttempt.abortReason === 'timeout'
+        ? 'Discourse browser sign-in expired before the authorization page was opened'
+        : 'Discourse browser sign-in was cancelled')
+    }
+    return current
+  }
+
+  /**
+   * Finish a classic-flow sign-in with the payload the user copied.
+   * @param {unknown} input - encrypted payload, redirect URL, or page text.
+   * @returns {Promise<Record<string, unknown>>} the signed-in status.
+   */
+  async function complete(input) {
+    requireServices()
+    const payload = extractEncryptedPayload(input)
+    if (attempt === undefined || attempt.state !== 'pending' || typeof attempt.promptResolve !== 'function') {
+      const current = await status()
+      if (current.signedIn === true) return { ...current, alreadySignedIn: true }
+      if (attempt?.mode === 'device') {
+        fail('this Discourse sign-in finishes in the browser; no payload is needed. Run discourse_login with action "status".')
+      }
+      fail('no Discourse browser sign-in is waiting for a payload; run discourse_login with action "start" first')
+    }
+    attempt.promptResolve(payload)
+    attempt.promptResolve = undefined
+    attempt.promptReject = undefined
+    let outcome
+    try {
+      outcome = await withTimeout(attempt.promise, 30000)
+    } catch (error) {
+      fail(error instanceof Error ? error.message : String(error))
+    }
+    if (outcome?.status !== 'authorized') {
+      fail(String(attempt?.error ?? 'Discourse did not authorize the pasted payload'))
+    }
+    const current = await status()
+    if (current.signedIn !== true) fail(String(current.attempt?.error ?? 'Discourse did not store the sign-in'))
+    return current
+  }
+
+  /**
+   * Withdraw a pending browser attempt without touching a stored session.
+   * @returns {Promise<Record<string, unknown>>} the resulting status.
+   */
+  async function cancel() {
+    if (disposed) fail('the Discourse plugin is shutting down')
+    const hadAttempt = attempt !== undefined && (attempt.state === 'pending' || attempt.state === 'starting')
+    let wasInFlight = false
+    if (services?.authorization !== undefined && typeof services.authorization.describe === 'function') {
+      try {
+        wasInFlight = services.authorization.describe(SESSION_KEY)?.inFlight === true
+      } catch {
+        // A service without describe support still accepts cancel below.
+      }
+    }
+    if (attempt !== undefined) {
+      const pending = attempt.promise
+      attempt.abortReason = 'cancelled'
+      clearAttempt()
+      if (pending !== undefined) {
+        try {
+          await withTimeout(pending, 5000)
+        } catch {
+          // The seam releases the key when the withdrawn flow settles.
+        }
+      }
+    } else if (services?.authorization !== undefined) {
+      try {
+        services.authorization.cancel(SESSION_KEY)
+      } catch {
+        // The seam may already have released the key.
+      }
+    }
+    return { ...(await status()), cancelled: hadAttempt || wasInFlight }
+  }
+
+  /**
+   * Revoke the stored user API key when possible and delete the local record.
+   * @returns {Promise<Record<string, unknown>>} the sign-out result.
+   */
+  async function logout() {
+    if (disposed) fail('the Discourse plugin is shutting down')
+    // Stop a running attempt before reading the store: an attempt that already
+    // committed would otherwise recreate the record after this sign-out.
+    const pending = attempt?.promise
+    clearAttempt()
+    if (pending !== undefined) {
+      try {
+        await withTimeout(pending, 10000)
+      } catch {
+        // A withdrawn attempt may never settle; its commit, if admitted, still completes before the store read.
+      }
+    }
+    const credentials = services?.credentials ?? getService(ctx, 'credentials')
+    const read = await readStoredSession(credentials, config)
+    if (read.error !== undefined && read.error.startsWith('the stored Discourse sign-in belongs to')) {
+      fail(`${read.error}; change baseUrl back or remove the record from the credential store`)
+    }
+    let revoked = false
+    let revokeWarning
+    if (read.session !== undefined) {
+      try {
+        const result = await client.call('POST', '/user-api-key/revoke.json', { userApiKey: read.session.key })
+        if (result === null || typeof result !== 'object') throw new Error('the forum returned a non-JSON response to the revoke request')
+        revoked = true
+      } catch (error) {
+        revokeWarning = error instanceof Error ? error.message : String(error)
+      }
+    }
+    if (credentials !== undefined && credentials !== null) {
+      try {
+        await credentials.deleteRecord(SESSION_KEY)
+      } catch (error) {
+        fail(`could not delete the stored Discourse sign-in: ${error instanceof Error ? error.message : String(error)}`)
+      }
+    }
+    return {
+      signedOut: true,
+      hadSession: read.session !== undefined,
+      storageAvailable: read.storageAvailable,
+      revoked,
+      ...(revokeWarning === undefined ? {} : { revokeWarning }),
+    }
+  }
+
+  /**
+   * Wait for a running attempt, bounded by the caller's requested seconds.
+   * @param {number} seconds - wait budget, 0-120.
+   * @returns {Promise<Record<string, unknown>>} the resulting status.
+   */
+  async function waitFor(seconds) {
+    const bounded = Math.max(0, Math.min(120, Math.round(Number(seconds) || 0)))
+    if (bounded === 0 || attempt?.promise === undefined) return status()
+    try {
+      await withTimeout(attempt.promise, bounded * 1000)
+    } catch {
+      // A timeout leaves the attempt running; status reports that.
+    }
+    return status()
+  }
+
+  /**
+   * Release the attempt and service references without touching the stored session.
+   * @returns {void}
+   */
+  function dispose() {
+    disposed = true
+    if (attempt?.controller !== undefined) {
+      attempt.abortReason = 'dispose'
+      try {
+        attempt.controller.abort()
+      } catch {
+        // An already aborted controller is harmless.
+      }
+    }
+    clearAttempt()
+    services = undefined
+  }
+
+  return { attach, start, status, complete, cancel, logout, waitFor, dispose }
 }
 
 // ---------------------------------------------------------------------------
@@ -421,9 +1483,10 @@ function projectUser(user, summary) {
 /**
  * Build every model-facing tool for one client.
  * @param {ReturnType<typeof createClient>} client - the request client.
+ * @param {ReturnType<typeof createLogin>} login - the browser sign-in controller.
  * @returns {Array<Record<string, any>>} registry-ready tool definitions.
  */
-function buildTools(client) {
+function buildTools(client, login) {
   const tools = []
   const limit = (value) => integer(value, client.config.maxItems, MAX_LIMIT)
   const page = (value) => integer(value, 1, 10000)
@@ -851,7 +1914,7 @@ function buildTools(client) {
     },
     async execute(args, exec) {
       const status = typeof args?.status === 'string' ? args.status : 'pending'
-      const payload = await client.call('GET', '/review.json', { query: { status }, signal: exec?.signal })
+      const payload = await client.call('GET', '/review.json', { query: { status }, signal: exec?.signal, privileged: true })
       const rows = Array.isArray(payload?.reviewables) ? payload.reviewables : Array.isArray(payload) ? payload : []
       const reviewables = rows.slice(0, limit(args?.limit)).map((item) => ({
         id: item?.id,
@@ -899,6 +1962,7 @@ function buildTools(client) {
       await client.call('DELETE', `/posts/${postId}.json`, {
         query: permanent ? { force_destroy: 'true' } : {},
         signal: exec?.signal,
+        privileged: true,
       })
       return { postId, permanent, deleted: true }
     },
@@ -924,7 +1988,7 @@ function buildTools(client) {
     async execute(args, exec) {
       client.writable('restoring a post')
       const postId = requiredInteger(args?.postId, 'postId')
-      await client.call('PUT', `/posts/${postId}/recover.json`, { signal: exec?.signal })
+      await client.call('PUT', `/posts/${postId}/recover.json`, { signal: exec?.signal, privileged: true })
       return { postId, restored: true }
     },
     render(_args, value) {
@@ -956,7 +2020,7 @@ function buildTools(client) {
       const status = typeof args?.status === 'string' ? args.status : 'active'
       if (status !== 'all') query.status = status
       if (optionalString(args?.query) !== undefined) query.query = optionalString(args.query)
-      const payload = await client.call('GET', '/admin/users.json', { query, signal: exec?.signal })
+      const payload = await client.call('GET', '/admin/users.json', { query, signal: exec?.signal, privileged: true })
       const rows = Array.isArray(payload) ? payload : payload?.users ?? []
       const users = (Array.isArray(rows) ? rows : []).slice(0, integer(args?.limit, 25, 100)).map((user) => ({
         id: user?.id,
@@ -1011,21 +2075,21 @@ function buildTools(client) {
       client.writable('moderating a user')
       const username = requiredString(args?.username, 'username').replace(/^@/, '')
       const action = requiredString(args?.action, 'action')
-      const userId = await resolveUserId(client, username, exec?.signal)
+      const userId = await resolveUserId(client, username, exec?.signal, { privileged: true })
       if (action === 'suspend' || action === 'silence') {
         const until = requiredString(args?.until, 'until')
         const body = action === 'suspend' ? { suspend_until: until } : { silenced_till: until }
         if (optionalString(args?.reason) !== undefined) body.reason = optionalString(args.reason)
         if (optionalString(args?.message) !== undefined) body.message = optionalString(args.message)
-        await client.call('PUT', `/admin/users/${userId}/${action}.json`, { body, signal: exec?.signal })
+        await client.call('PUT', `/admin/users/${userId}/${action}.json`, { body, signal: exec?.signal, privileged: true })
         return { userId, username, action, until }
       }
       if (action === 'activate') {
-        await client.call('PUT', `/admin/users/${userId}/activate.json`, { signal: exec?.signal })
+        await client.call('PUT', `/admin/users/${userId}/activate.json`, { signal: exec?.signal, privileged: true })
         return { userId, username, action }
       }
       const lifted = action === 'unsuspend' ? 'suspend' : 'silence'
-      await client.call('DELETE', `/admin/users/${userId}/${lifted}.json`, { signal: exec?.signal })
+      await client.call('DELETE', `/admin/users/${userId}/${lifted}.json`, { signal: exec?.signal, privileged: true })
       return { userId, username, action }
     },
     render(_args, value) {
@@ -1061,10 +2125,11 @@ function buildTools(client) {
         await client.call('PUT', `/admin/site_settings/${encodeURIComponent(name)}.json`, {
           body: { [name]: coerceSettingValue(args.value) },
           signal: exec?.signal,
+          privileged: true,
         })
         return { updated: true, name, value: args.value }
       }
-      const payload = await client.call('GET', '/admin/site_settings.json', { signal: exec?.signal })
+      const payload = await client.call('GET', '/admin/site_settings.json', { signal: exec?.signal, privileged: true })
       const rows = Array.isArray(payload) ? payload : payload?.site_settings ?? []
       const filter = optionalString(args?.filter)?.toLowerCase()
       const name = optionalString(args?.name)?.toLowerCase()
@@ -1120,6 +2185,7 @@ function buildTools(client) {
       const payload = await client.call('GET', `/admin/reports/${report}.json`, {
         query: { start_date: isoDay(start), end_date: isoDay(end) },
         signal: exec?.signal,
+        privileged: true,
       })
       const body = payload?.report ?? payload ?? {}
       const points = Array.isArray(body?.data) ? body.data.slice(-days) : []
@@ -1139,6 +2205,82 @@ function buildTools(client) {
     },
     presentCall(args) {
       return { card: 'generic', title: `Discourse report: ${clip(args?.report ?? 'topics', 30)}`, kind: 'read' }
+    },
+  })
+
+  add({
+    name: 'discourse_login',
+    description: 'Sign in to Discourse through the user\'s browser and inspect or end the stored session. `start` returns a verification URL and code for the forum authorization page; after the user approves it, call `status` (optionally with `waitSeconds`) to collect the signed-in account. `complete` finishes older forums that display an encrypted payload to paste, `cancel` withdraws a pending attempt, and `logout` revokes the user API key. A signed-in user API key is scoped to that account; with `authMode: auto`, staff and admin tools keep using the configured apiKey.',
+    parameters: {
+      type: 'object',
+      additionalProperties: false,
+      properties: {
+        action: { type: 'string', enum: ['start', 'status', 'complete', 'cancel', 'logout'], description: 'Operation to perform. `start` begins browser authorization, `status` reports the stored session and any pending attempt, `complete` accepts the encrypted payload from an older forum, `cancel` withdraws a pending attempt, and `logout` revokes the session.', default: 'status' },
+        scopes: { type: 'string', description: 'Comma-separated scopes for `start`, overriding `loginScopes`; for example `read,session_info` for a read-only session.' },
+        mode: { type: 'string', enum: ['auto', 'device', 'manual'], description: 'How `start` obtains authorization. `auto` uses Discourse\'s device code and falls back to the classic payload page, `device` requires the device code, and `manual` always uses the classic page.', default: 'auto' },
+        force: { type: 'boolean', description: 'With `start`, authorize a new session even when one is already stored.', default: false },
+        payload: { type: 'string', description: 'With `complete`, the encrypted payload shown by an older Discourse page after approval, or its full redirect URL.' },
+        waitSeconds: { type: 'integer', description: 'With `status`, wait up to this many seconds for a pending browser sign-in before reporting, 0-120.', default: 0 },
+      },
+    },
+    async execute(args, _exec) {
+      const action = typeof args?.action === 'string' ? args.action : 'status'
+      if (action === 'start') return login.start({ scopes: args?.scopes, mode: args?.mode, force: args?.force === true })
+      if (action === 'status') {
+        const wait = typeof args?.waitSeconds === 'number' ? integer(args.waitSeconds, 0, 120, 0) : 0
+        return wait > 0 ? login.waitFor(wait) : login.status()
+      }
+      if (action === 'complete') return login.complete(args?.payload)
+      if (action === 'cancel') return login.cancel()
+      if (action === 'logout') return login.logout()
+      fail('invalid arguments: `action` must be one of start, status, complete, cancel, or logout')
+    },
+    render(_args, value) {
+      if (value.signedOut === true) {
+        const lines = [value.revoked === true ? 'Signed out of Discourse and revoked the stored user API key.' : 'Signed out of Discourse.']
+        if (value.revokeWarning !== undefined) lines.push(`The forum did not confirm revocation: ${value.revokeWarning}`)
+        return [{ type: 'text', text: lines.join('\n') }]
+      }
+      if (value.signedIn === true) {
+        const user = value.session?.username ? `@${value.session.username}` : 'the stored account'
+        const lines = [`Signed in to ${value.baseUrl} as ${user}.`]
+        if (value.cancelled === true) lines.push('Cancelled the pending browser sign-in.')
+        if (Array.isArray(value.session?.scopes) && value.session.scopes.length > 0) lines.push(`Scopes: ${value.session.scopes.join(', ')}`)
+        if (value.session?.expiresAt) lines.push(`Key expires: ${value.session.expiresAt}`)
+        if (value.alreadySignedIn === true) lines.push('A browser sign-in is already stored; pass `force: true` to authorize again.')
+        if (value.activeSource) lines.push(`Active credential: ${value.activeSource}`)
+        if (value.attempt?.status === 'failed') lines.push(`The last sign-in attempt failed: ${value.attempt.error ?? 'unknown error'}`)
+        else if (value.attempt?.status === 'expired') lines.push('The last sign-in attempt expired; start again if you need a fresh key.')
+        return [{ type: 'text', text: lines.join('\n') }]
+      }
+      const lines = [`Not signed in to ${value.baseUrl}.`]
+      if (value.cancelled === true) lines.push('Cancelled the pending browser sign-in.')
+      if (value.apiKeyConfigured === true) lines.push('The configured API key is used when no browser session is stored.')
+      if (value.sessionExpired === true) lines.push('The stored session has expired; start a new sign-in.')
+      if (value.sessionError) lines.push(`Stored session problem: ${value.sessionError}`)
+      if (value.warning) lines.push(value.warning)
+      const attempt = value.attempt
+      if (attempt !== undefined) {
+        if (attempt.status === 'pending' || attempt.status === 'starting') {
+          lines.push('', `Browser sign-in ${attempt.status}.`)
+          if (attempt.mode) lines.push(`Mode: ${attempt.mode}`)
+          if (attempt.url) lines.push(`Open: ${attempt.url}`)
+          if (attempt.userCode) lines.push(`Code: ${attempt.userCode}`)
+          if (attempt.prompt) lines.push(attempt.prompt)
+          if (attempt.expiresAt) lines.push(`Expires: ${attempt.expiresAt}`)
+          lines.push('After approving in the browser, run discourse_login with action "status".')
+        } else if (attempt.status === 'failed') {
+          lines.push('', `Browser sign-in failed: ${attempt.error ?? 'unknown error'}`)
+        } else if (attempt.status === 'expired') {
+          lines.push('', 'Browser sign-in expired; start again.')
+        } else if (attempt.status === 'cancelled') {
+          lines.push('', 'Browser sign-in was cancelled.')
+        }
+      }
+      return [{ type: 'text', text: lines.join('\n') }]
+    },
+    presentCall(args) {
+      return { card: 'generic', title: args?.action === 'start' ? 'Sign in to Discourse' : `Discourse login: ${clip(args?.action ?? 'status', 20)}`, kind: 'other' }
     },
   })
 
@@ -1180,11 +2322,12 @@ function extractTopicId(input) {
  * @param {ReturnType<typeof createClient>} client - the request client.
  * @param {string} username - forum username.
  * @param {AbortSignal} [signal] - caller cancellation.
+ * @param {{ privileged?: boolean }} [options] - staff/admin request intent.
  * @returns {Promise<number>} the user id.
  */
-async function resolveUserId(client, username, signal) {
+async function resolveUserId(client, username, signal, options = {}) {
   if (/^\d+$/.test(username)) return Number(username)
-  const payload = await client.call('GET', `/u/${encodeURIComponent(username)}.json`, { signal })
+  const payload = await client.call('GET', `/u/${encodeURIComponent(username)}.json`, { signal, privileged: options.privileged === true })
   const id = payload?.user?.id ?? payload?.id
   if (typeof id !== 'number') fail(`could not resolve @${username} to a user id on ${client.config.baseUrl}`)
   return id
@@ -1232,9 +2375,15 @@ function isoDay(date) {
  * @returns {void}
  */
 export function apply(ctx, config) {
-  const client = createClient(readConfig(config))
-  const tools = buildTools(client)
+  const resolved = readConfig(config)
+  const client = createClient(resolved, () => getService(ctx, 'credentials'))
+  const login = createLogin(ctx, resolved, client)
+  const tools = buildTools(client, login)
   for (const tool of tools) {
     ctx.effect(() => ctx.tools.register(tool), `discourse:${tool.name}`)
   }
+  if (login.attach(ctx) !== true && typeof ctx.inject === 'function') {
+    ctx.inject(['credentials', 'authorization'], (scope) => login.attach(scope))
+  }
+  ctx.effect(() => () => login.dispose(), 'discourse:login lifetime')
 }

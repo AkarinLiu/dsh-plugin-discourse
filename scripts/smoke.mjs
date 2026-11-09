@@ -30,6 +30,12 @@ const ctx = {
       if (typeof dispose === 'function') dispose()
     }
   },
+  get() {
+    return undefined
+  },
+  inject(_deps, callback) {
+    return callback(ctx)
+  },
 }
 
 apply(ctx, { baseUrl, readOnly: true, maxItems: 5 })
@@ -51,6 +57,7 @@ const expected = [
   'discourse_moderate_user',
   'discourse_site_settings',
   'discourse_admin_stats',
+  'discourse_login',
 ]
 
 for (const name of expected) {
@@ -72,6 +79,17 @@ for (const [name, tool] of registry) {
     if (typeof schema.description !== 'string' || schema.description.length === 0) problems.push(`${name}.${key}: parameter needs a description`)
     if (schema.type === undefined && schema.oneOf === undefined) problems.push(`${name}.${key}: parameter needs a type`)
   }
+}
+
+// The login tool must report a signed-out state without the credential store,
+// and it must not expose a key it never stored.
+try {
+  const value = await registry.get('discourse_login').execute({ action: 'status' }, {})
+  if (value?.signedIn !== false) problems.push('discourse_login status should report signed out offline')
+  if (value?.storageAvailable !== false) problems.push('discourse_login status should report missing credential storage offline')
+  if (JSON.stringify(value).includes('"key"')) problems.push('discourse_login status leaked a key field')
+} catch (error) {
+  problems.push(`discourse_login status failed offline: ${error.message}`)
 }
 
 // A malformed forum URL must fail at activation with a usable diagnostic,

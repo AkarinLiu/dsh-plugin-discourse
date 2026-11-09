@@ -56,6 +56,7 @@ const required = [
   'locale/zh.json',
   'icon.svg',
   'scripts/smoke.mjs',
+  'scripts/login-test.mjs',
   'scripts/doctor.mjs',
   'scripts/verify-package.mjs',
 ]

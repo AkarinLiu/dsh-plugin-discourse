@@ -1,6 +1,7 @@
 # Inserts the Discourse tool bundle into the current DSH profile.
 # Change `baseUrl` to your forum and point `apiKey` at an admin-scoped key
-# before enabling writes.
+# before enabling writes. Browser sign-in stores a scoped user API key in the
+# DSH credential store, so no key is required in this file for `discourse_login`.
 - insert:
     - id: discourse
       name: dsh-plugin-discourse
@@ -11,3 +12,8 @@
         readOnly: false
         timeoutMs: 20000
         maxItems: 12
+        authMode: auto
+        loginScopes: read,write,session_info
+        loginClientId: dsh-plugin-discourse
+        loginApplicationName: DeepSeek Harness
+        loginTimeoutMs: 600000
