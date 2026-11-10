@@ -1,7 +1,6 @@
 # dsh-plugin-discourse
 
-[![npm](https://img.shields.io/npm/v/dsh-plugin-discourse.svg)](https://www.npmjs.com/package/dsh-plugin-discourse)
-[![Publish to npm](https://github.com/AkarinLiu/dsh-plugin-discourse/actions/workflows/publish.yml/badge.svg)](https://github.com/AkarinLiu/dsh-plugin-discourse/actions/workflows/publish.yml)
+[![npm](https://img.shields.io/npm/v/dsh-plugin-discourse.svg?logo=npm&color=red)](https://www.npmjs.com/package/dsh-plugin-discourse/v/latest) ![NPM Downloads](https://img.shields.io/npm/dw/dsh-plugin-discourse?style=flat&logo=npm&color=red) [![Publish to npm](https://github.com/AkarinLiu/dsh-plugin-discourse/actions/workflows/publish.yml/badge.svg)](https://github.com/AkarinLiu/dsh-plugin-discourse/actions/workflows/publish.yml)
 
 Discourse administration and agent tools for the [DeepSeek Harness](https://github.com/deepseek-ai).
 
@@ -16,25 +15,25 @@ User → DSH agent → discourse_* tools → Discourse REST API → forum
 
 ## Tools
 
-| Tool | Group | What it does | Key needed |
-|---|---|---|---|
-| `discourse_login` | auth | Start browser authorization, report the session, finish an older payload page, cancel a pending attempt, or sign out | no |
-| `discourse_search` | read | Search topics, posts, and users | no |
-| `discourse_topics` | read | List a feed (`latest`/`new`/`unread`/`top`) or one category | no |
-| `discourse_topic` | read | Read a topic and a slice of its posts | no |
-| `discourse_categories` | read | List categories and subcategories with ids | no |
-| `discourse_user` | read | Read one profile with roles, trust level, and activity counts | no |
-| `discourse_create_topic` | author | Create a topic with category and tags | yes |
-| `discourse_reply` | author | Reply to a topic, optionally to a specific post | yes |
-| `discourse_update_post` | author | Replace a post body | yes |
-| `discourse_flag_post` | author | Flag a post as spam, inappropriate, or off-topic | yes |
-| `discourse_review_queue` | moderate | List flagged items awaiting a decision | moderator |
-| `discourse_delete_post` | moderate | Delete or permanently destroy a post | moderator |
-| `discourse_restore_post` | moderate | Restore a deleted post | moderator |
-| `discourse_admin_users` | admin | Search the user directory by status and order | admin |
-| `discourse_moderate_user` | admin | Suspend, silence, lift a sanction, or activate an account | admin |
-| `discourse_site_settings` | admin | Read settings, or change one by name | admin |
-| `discourse_admin_stats` | admin | Read a dashboard report as a time series | admin |
+| Tool                      | Group    | What it does                                                                                                         | Key needed |
+| ------------------------- | -------- | -------------------------------------------------------------------------------------------------------------------- | ---------- |
+| `discourse_login`         | auth     | Start browser authorization, report the session, finish an older payload page, cancel a pending attempt, or sign out | no         |
+| `discourse_search`        | read     | Search topics, posts, and users                                                                                      | no         |
+| `discourse_topics`        | read     | List a feed (`latest`/`new`/`unread`/`top`) or one category                                                          | no         |
+| `discourse_topic`         | read     | Read a topic and a slice of its posts                                                                                | no         |
+| `discourse_categories`    | read     | List categories and subcategories with ids                                                                           | no         |
+| `discourse_user`          | read     | Read one profile with roles, trust level, and activity counts                                                        | no         |
+| `discourse_create_topic`  | author   | Create a topic with category and tags                                                                                | yes        |
+| `discourse_reply`         | author   | Reply to a topic, optionally to a specific post                                                                      | yes        |
+| `discourse_update_post`   | author   | Replace a post body                                                                                                  | yes        |
+| `discourse_flag_post`     | author   | Flag a post as spam, inappropriate, or off-topic                                                                     | yes        |
+| `discourse_review_queue`  | moderate | List flagged items awaiting a decision                                                                               | moderator  |
+| `discourse_delete_post`   | moderate | Delete or permanently destroy a post                                                                                 | moderator  |
+| `discourse_restore_post`  | moderate | Restore a deleted post                                                                                               | moderator  |
+| `discourse_admin_users`   | admin    | Search the user directory by status and order                                                                        | admin      |
+| `discourse_moderate_user` | admin    | Suspend, silence, lift a sanction, or activate an account                                                            | admin      |
+| `discourse_site_settings` | admin    | Read settings, or change one by name                                                                                 | admin      |
+| `discourse_admin_stats`   | admin    | Read a dashboard report as a time series                                                                             | admin      |
 
 Every listing is bounded (12 items by default, 50 maximum) and every post body is clipped, so a
 thread search never floods the model context. Results keep ids, so a follow-up call reads the detail.
@@ -122,19 +121,19 @@ it at your forum, add an override to your **profile's** `cordis.patch.yml` (`$DS
 
 A loader override replaces the row's `config` wholesale, so restate every key you want to keep.
 
-| Key | Default | Meaning |
-|---|---|---|
-| `baseUrl` | `https://meta.discourse.org` | Forum origin. Point this at your own forum. |
-| `apiKey` | `''` | Discourse API key. Empty means anonymous, read-only access. |
-| `apiUsername` | `''` → `system` | Username the key acts as. |
-| `readOnly` | `false` | Blocks every mutating tool when `true`. |
-| `timeoutMs` | `20000` | Per-request deadline, 1000–120000. |
-| `maxItems` | `12` | Default listing size, 1–50. |
-| `authMode` | `auto` | `auto` uses a stored browser session for normal calls and `apiKey` for staff/admin calls; `api-key` ignores the session; `user` requires it for every call. |
-| `loginScopes` | `read,write,session_info` | Comma-separated scopes requested by browser sign-in. Narrow or extend this to match the forum's `allow_user_api_key_scopes`. |
-| `loginClientId` | `dsh-plugin-discourse` | Client id Discourse records with the authorized key. |
-| `loginApplicationName` | `DeepSeek Harness` | Application name shown on the forum authorization page. |
-| `loginTimeoutMs` | `600000` | Browser sign-in deadline, 30000–1800000. Discourse's device code lives 10 minutes. |
+| Key                    | Default                      | Meaning                                                                                                                                                     |
+| ---------------------- | ---------------------------- | ----------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `baseUrl`              | `https://meta.discourse.org` | Forum origin. Point this at your own forum.                                                                                                                 |
+| `apiKey`               | `''`                         | Discourse API key. Empty means anonymous, read-only access.                                                                                                 |
+| `apiUsername`          | `''` → `system`              | Username the key acts as.                                                                                                                                   |
+| `readOnly`             | `false`                      | Blocks every mutating tool when `true`.                                                                                                                     |
+| `timeoutMs`            | `20000`                      | Per-request deadline, 1000–120000.                                                                                                                          |
+| `maxItems`             | `12`                         | Default listing size, 1–50.                                                                                                                                 |
+| `authMode`             | `auto`                       | `auto` uses a stored browser session for normal calls and `apiKey` for staff/admin calls; `api-key` ignores the session; `user` requires it for every call. |
+| `loginScopes`          | `read,write,session_info`    | Comma-separated scopes requested by browser sign-in. Narrow or extend this to match the forum's `allow_user_api_key_scopes`.                                |
+| `loginClientId`        | `dsh-plugin-discourse`       | Client id Discourse records with the authorized key.                                                                                                        |
+| `loginApplicationName` | `DeepSeek Harness`           | Application name shown on the forum authorization page.                                                                                                     |
+| `loginTimeoutMs`       | `600000`                     | Browser sign-in deadline, 30000–1800000. Discourse's device code lives 10 minutes.                                                                          |
 
 Anonymous reads work out of the box against the default forum, so you can try `discourse_topics`
 before configuring anything.
@@ -238,6 +237,7 @@ push to `main` or a `v*` tag, and every pull request, verifies the package, and 
 [provenance](https://docs.npmjs.com/generating-provenance-statements).
 
 1. Bump `version` in `package.json` (the tag must match it exactly).
+
 2. Commit, then tag and push:
 
    ```bash
@@ -251,12 +251,12 @@ push to `main` or a `v*` tag, and every pull request, verifies the package, and 
 Before the first release, add a **Trusted Publisher** on npmjs.com (package page → *Settings* →
 *Trusted Publishing* → *GitHub Actions*):
 
-| Field | Value |
-|---|---|
-| Repository | `AkarinLiu/dsh-plugin-discourse` |
-| Workflow file | `publish.yml` |
-| Environment | *(leave empty)* |
-| Allowed action | `npm publish` |
+| Field          | Value                            |
+| -------------- | -------------------------------- |
+| Repository     | `AkarinLiu/dsh-plugin-discourse` |
+| Workflow file  | `publish.yml`                    |
+| Environment    | *(leave empty)*                  |
+| Allowed action | `npm publish`                    |
 
 No `NPM_TOKEN` secret is needed: the workflow exchanges the GitHub OIDC token
 (`id-token: write`) for publish rights and attaches provenance. npm now requires an interactive 2FA
